@@ -1,0 +1,7 @@
+# 実行時に生成される成果物
+EtcCollected_*/
+EtcCollect_Check.log
+EtcAnalyze.log
+EtcAnalysis_*.csv
+EtcFindings_*.csv
+.DS_Store
