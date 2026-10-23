@@ -9,6 +9,7 @@ research-linux/
 ├── collect-EtcData.ps1    # /etc 一括取得(SSH + Posh-SSH / tar.gz アーカイブ → SFTP ダウンロード → ローカル展開)
 ├── analyze-EtcData.ps1   # 収集データの解析(設定一覧 CSV + 要確認項目 CSV を出力)
 ├── TargetServers.csv      # 入力: 対象サーバー一覧(サンプル)
+├── test/sshlab/           # 鍵認証の検証用 SSH サーバー(Dockerfile / 検証用 CSV)
 ├── README.md
 └── .gitignore
 ```
@@ -41,6 +42,7 @@ $cred = Get-Credential admin                        # 資格情報を一度だ�
 .\collect-EtcData.ps1 -Credential $cred -InputCsvPath .\Targets.csv        # 資格情報を使い回す
 .\collect-EtcData.ps1 -UserName root -NoSudo                               # root 直接ログイン(sudo 不要)
 .\collect-EtcData.ps1 -UserName admin -KeepArchive                         # tar.gz を残す(既定は展開後に削除)
+.\collect-EtcData.ps1 -UserName admin -KeyFile ~\.ssh\id_ed25519           # 秘密鍵で接続(公開鍵認証)
 
 # ── 2) 解析 ──
 $dir = Get-ChildItem -Directory -Path .\EtcCollected_* | Sort-Object Name -Descending | Select-Object -First 1
@@ -106,11 +108,11 @@ powershell -ExecutionPolicy Bypass -File .\collect-EtcData.ps1 -UserName admin
 | ローカル | `tar` コマンド(Windows 10 1803+ には標準搭載) |
 | 対象サーバー | sshd が稼働していること(対象側に PowerShell は不要) |
 | ネットワーク | SSH: TCP **22**(CSV / パラメーターで変更可) |
-| 認証 | パスワード認証(`-Credential` / 実行時プロンプト) |
+| 認証 | パスワード認証(`-Credential` / 実行時プロンプト)、または秘密鍵による公開鍵認証(`-KeyFile` / CSV の `KeyFile` 列) |
 
 ### 入力ファイル(TargetServers.csv)
 
-`ComputerName` 列が必須。任意で `UserName` / `Port` 列を追加すると、 **行ごとに接続先を上書き** できます
+`ComputerName` 列が必須。任意で `UserName` / `Port` / `KeyFile` 列を追加すると、 **行ごとに接続先を上書き** できます
 (空欄の行はパラメーター既定値にフォールバック)。空行は自動的に無視されます。
 
 `UserName` 列に複数のユーザーが混在する場合、 **ユーザーごとに 1 回ずつ** パスワードを入力します
@@ -124,6 +126,32 @@ web01.example.local,admin,22
 db01.example.local,,2222
 ```
 
+`KeyFile` 列(または `-KeyFile`)に秘密鍵のパスを指定した行は **公開鍵認証** で接続します
+(`~` や相対パスはカレントディレクトリ基準で解決)。パスワード認証の行と混在できます。
+
+```
+ComputerName,UserName,Port,KeyFile
+web01.example.local,admin,22,
+app01.example.local,deploy,22,C:\keys\deploy_ed25519
+```
+
+### 秘密鍵による接続(公開鍵認証)
+
+| 項目 | 動作 |
+| --- | --- |
+| 鍵の指定 | `-KeyFile`(全行の既定)、または CSV の `KeyFile` 列(行単位で優先)。OpenSSH 形式 / PEM 形式の鍵に対応(Posh-SSH 3.x の対応形式に準拠)。 |
+| ユーザー名 | 必須。`-UserName` / `-Credential` のユーザー名、または CSV の `UserName` 列。 |
+| パスフレーズ | 鍵ファイルごとに 1 回だけ入力(パスフレーズなしの鍵は Enter のみ)。`-KeyPassphrase <SecureString>` で事前指定すると入力を省略。 |
+| sudo パスワード | ログインパスワードが無いため、`-SudoPassword` を指定するか、ユーザーごとに 1 回入力。**空 Enter の場合は NOPASSWD 前提で `sudo -n`** を使用(パスワードを要求されたら待たずに失敗)。 |
+| `-Credential` との併用 | `-Credential` のユーザー名のみを使用します(パスワード欄はパスフレーズとして扱いません)。 |
+| 鍵ファイルが無い | そのホストは `失敗`(`秘密鍵ファイルが見つかりません`)として記録し、次のホストへ進みます。 |
+
+```powershell
+# パスフレーズを事前に入力して使い回す(sudo は NOPASSWD の場合)
+$pp = Read-Host -AsSecureString '鍵のパスフレーズ'
+.\collect-EtcData.ps1 -UserName admin -KeyFile ~\.ssh\id_ed25519 -KeyPassphrase $pp
+```
+
 ### パラメーター
 
 | パラメーター | 既定値 | 説明 |
@@ -132,12 +160,14 @@ db01.example.local,,2222
 | `-OutputPath` | `EtcCollected_<日時>` | 取得先フォルダー。 |
 | `-LogPath` | `EtcCollect_Check.log` | 処理ログ。 |
 | `-Credential` / `-UserName` / `-Port` | (実行時入力) / 22 | SSH 接続情報(UserName 列が空の行の既定)。CSV の `UserName` 列を行単位で優先し、ユーザーごとに 1 回ずつパスワードを入力。 |
+| `-KeyFile` | (なし) | 秘密鍵ファイルのパス。指定すると公開鍵認証で接続(CSV の `KeyFile` 列を行単位で優先)。 |
+| `-KeyPassphrase` | (実行時入力) | 秘密鍵のパスフレーズ(SecureString)。未指定時は鍵ファイルごとに 1 回入力。 |
 | `-ConnectionTimeoutSeconds` | `15` | TCP 接続確認のタイムアウト秒。 |
 | `-CommandTimeoutSeconds` | `300` | リモートコマンド(tar 等)のタイムアウト秒。 |
 | `-EtcPath` | `/etc` | 取得対象ディレクトリ。 |
 | `-NoCommandReport` | (off) | コマンドレポート(commands/)の収集をスキップ。 |
 | `-NoSudo` | (off) | sudo を使わない(root 直接ログイン時、または機密ファイルを意図的に除外する場合)。 |
-| `-SudoPassword` | (ログインと同じ) | sudo パスワードが別の場合に指定。 |
+| `-SudoPassword` | (ログインと同じ) | sudo パスワードが別の場合に指定。鍵認証時は未指定ならユーザーごとに入力(空なら `sudo -n`)。 |
 | `-KeepArchive` | (off) | tar.gz を展開後も保持(既定は展開後に削除。展開警告時は自動的に保持)。 |
 
 ### sudo 方式(参考リポジトリと同じ)
@@ -146,6 +176,7 @@ db01.example.local,,2222
 | --- | --- | --- |
 | 通常(sudo にパスワードあり) | (既定) | `sudo -S`。既定で **そのユーザーのログインパスワード** を使用。パスワードは `printf '%s\n'` 経由のため `ps` に出ず、`echo` のバックスラッシュ解釈(dash 系 /bin/sh)の影響も受けません。 |
 | sudo パスワードが別 | `-SudoPassword <SecureString>` | 全ホスト共通の sudo パスワードを指定。 |
+| 鍵認証 + NOPASSWD sudo | (sudo パスワード入力で空 Enter) | `sudo -n`。パスワードを要求された場合は待たずに失敗します。 |
 | root で直接ログイン / 機密ファイル除外 | `-NoSudo` | sudo を使わない。`/etc/shadow` 等の読み取り不可ファイルは一部欠けた状態で収集されます。 |
 
 ### 出力
@@ -165,6 +196,7 @@ EtcCollected_<日時>/
 | 列 | 説明 |
 | --- | --- |
 | `ComputerName` | サーバー名 |
+| `AuthMethod` | 認証方式(`password` / `key`) |
 | `Status` | `成功` / `失敗`(失敗理由は `ErrorMessage`) |
 | `ArchiveSizeBytes` / `FileCount` / `Sha256` | アーカイブサイズ / ファイル数 / ハッシュ |
 | `LocalEtcPath` / `LocalArchivePath` / `LocalMetadataPath` | ローカルの保存先 |
@@ -229,13 +261,88 @@ EtcCollected_<日時>/
 - `/etc/localtime` 等のシンボリックリンクは、Windows 展開時に警告が出ることがあります(展開自体は継続)。
 - SSH の `Include` に相対パス・特殊トークン(`%h` 等)が使われている場合は近似解釈になります。
 
+## 検証環境(鍵認証の接続試験用 SSH コンテナ)
+
+`test/sshlab/Dockerfile` で、鍵認証のみ許可した SSH サーバーをローカルに立てて接続試験ができます
+(Docker Desktop 等が必要)。対象側に `/etc` があれば良いため、Debian コンテナを Linux サーバー代わりに使います。
+
+| ユーザー | 秘密鍵 | パスフレーズ | sudo |
+| --- | --- | --- | --- |
+| `keyuser` | `keyuser_ed25519` / `keyuser_rsa` | なし | NOPASSWD(sudo パスワード入力は空 Enter) |
+| `keypp` | `keypp_ed25519` | `KeyPass#1` | パスワード必須(`SudoPass#1`) |
+
+パスワード認証は無効(鍵のみ)です。鍵はイメージのビルド時に生成されるので、`docker cp` で取り出して使います。
+
+> **注意:** 検証専用です。鍵・パスワードが固定値のため、ポートは `127.0.0.1` にのみ公開し、本番環境では使わないでください。
+> 取り出した鍵(`test/sshlab/keys/`)は `.gitignore` 済みです。
+
+### 1) 起動と鍵の取り出し
+
+リポジトリのルートで実行します。
+
+```powershell
+docker build -t etc-sshlab .\test\sshlab
+docker run -d --name etc-sshlab -p 127.0.0.1:2222:22 etc-sshlab
+docker cp etc-sshlab:/lab/keys .\test\sshlab\keys
+```
+
+### 2) 接続試験
+
+`test/sshlab/TargetServers.lab.csv` には 3 行(`keyuser` の ed25519 / RSA、`keypp` の ed25519)が入っています。
+
+```powershell
+.\collect-EtcData.ps1 -InputCsvPath .\test\sshlab\TargetServers.lab.csv
+```
+
+実行中に次の入力を求められます(鍵ファイル・ユーザーごとに 1 回ずつ)。
+
+| プロンプト | 入力値 |
+| --- | --- |
+| 秘密鍵のパスフレーズ (key=...keyuser_ed25519) | 空 Enter |
+| sudo パスワード (user=keyuser) | 空 Enter(NOPASSWD → `sudo -n`) |
+| 秘密鍵のパスフレーズ (key=...keyuser_rsa) | 空 Enter |
+| 秘密鍵のパスフレーズ (key=...keypp_ed25519) | `KeyPass#1` |
+| sudo パスワード (user=keypp) | `SudoPass#1` |
+
+```powershell
+# 結果確認(3 行とも Status=成功 / AuthMethod=key。sudo が効いていれば etc/shadow も取得される)
+Import-Csv .\EtcCollected_<日時>\EtcCollectResult.csv | Format-Table ComputerName,AuthMethod,Status,FileCount,RemoteTempCleaned,ErrorMessage -AutoSize
+```
+
+初回接続時は Posh-SSH がホスト鍵を信頼するか確認してくるので `y` で登録します
+(非対話で実行する場合は事前登録が必要。登録先は `~/.poshssh/hosts.json`)。
+
+異常系は次の操作で確認できます。いずれも該当ホストが `失敗` として記録され、処理は次のホストへ進みます。
+
+| 試験内容 | 操作 | 期待される ErrorMessage |
+| --- | --- | --- |
+| パスフレーズ誤り | `keypp` でパスフレーズを誤入力 | `SSH接続失敗: The random check bytes of the OpenSSH key do not match ...` |
+| パスフレーズ未入力 | `keypp` でパスフレーズを空 Enter | `SSH接続失敗: Private key is encrypted but passphrase is empty.` |
+| 未登録の鍵 | `keypp` に `keyuser_ed25519` を指定 | `SSH接続失敗: Permission denied (publickey).` |
+| 鍵ファイルなし | 存在しないパスを `-KeyFile` に指定 | `SSH接続失敗: 秘密鍵ファイルが見つかりません: ...` |
+| sudo パスワード誤り / 空 | `keypp` で sudo パスワードを誤入力 / 空 Enter | `アーカイブ作成失敗: ... sudo: a password is required` 等 |
+
+### 3) 停止・削除
+
+```powershell
+docker stop etc-sshlab                 # 停止(再開は docker start etc-sshlab)
+docker rm -f etc-sshlab; docker rmi etc-sshlab   # 削除
+Remove-SSHTrustedHost -HostName 127.0.0.1        # Posh-SSH に登録したホスト鍵の削除
+Remove-Item -Recurse .\test\sshlab\keys          # 取り出した鍵の削除
+```
+
+イメージを作り直すとホスト鍵と秘密鍵が変わります。`docker cp` で鍵を取り出し直し、
+`Remove-SSHTrustedHost -HostName 127.0.0.1` で古いホスト鍵の登録を削除してから接続してください。
+
 ## トラブルシューティング
 
 | 症状 | 主な原因と対処 |
 | --- | --- |
 | `SSH接続失敗 / TCP ... へ接続できませんでした` | ホスト名・`Port`・ファイアウォール(TCP 22)を確認。 |
-| `SSH接続失敗 / Permission denied` | `-UserName` を確認。公開鍵運用の場合は Posh-SSH の鍵認証に変更が必要。 |
-| `sudo: a password is required` / sudo 失敗 | `-SudoPassword` で別パスワードを指定、または `-NoSudo`。 |
+| `SSH接続失敗 / Permission denied` | `-UserName` を確認。公開鍵運用の場合は `-KeyFile`(または CSV の `KeyFile` 列)を指定。 |
+| `SSH接続失敗 / 秘密鍵ファイルが見つかりません` | `-KeyFile` / `KeyFile` 列のパスを確認(相対パスはカレントディレクトリ基準)。 |
+| 鍵認証で `Invalid private key file` 等 | パスフレーズ誤り、または未対応の鍵形式。`ssh-keygen -p -m PEM -f <鍵>` で PEM 形式に変換すると解消する場合があります。 |
+| `sudo: a password is required` / sudo 失敗 | `-SudoPassword` で別パスワードを指定、または `-NoSudo`。鍵認証で sudo パスワードを空にした場合は NOPASSWD 設定を確認。 |
 | `tar コマンドが見つかりません` | Windows 10 1803+ / Windows Server 1809+ を使用、または tar を PATH へ。 |
 | `アーカイブ作成失敗` | 対象が BusyBox 系で `stat`/`sha256sum` が無い可能性(メタデータ取得失敗は継続可)。TAREXIT と ERRSUMMARY をログで確認。 |
 | 分析CSV に shadow 由来の列が埋まらない | `-NoSudo` で収集した可能性。sudo 付きで再収集してください。 |

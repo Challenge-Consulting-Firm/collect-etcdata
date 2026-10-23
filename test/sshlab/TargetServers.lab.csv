@@ -1,0 +1,4 @@
+ComputerName,UserName,Port,KeyFile
+127.0.0.1,keyuser,2222,.\test\sshlab\keys\keyuser_ed25519
+127.0.0.1,keyuser,2222,.\test\sshlab\keys\keyuser_rsa
+127.0.0.1,keypp,2222,.\test\sshlab\keys\keypp_ed25519

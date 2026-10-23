@@ -5,3 +5,6 @@ EtcAnalyze.log
 EtcAnalysis_*.csv
 EtcFindings_*.csv
 .DS_Store
+
+# 検証用 SSH コンテナから取り出した鍵
+test/sshlab/keys/
