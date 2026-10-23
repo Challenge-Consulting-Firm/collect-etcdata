@@ -29,10 +29,16 @@
     パスワードを入力します(同一ユーザーは最初の 1 回のみ)。sudo パスワードは既定で
     そのユーザーのログインパスワードを使用します。
 
+    -KeyFile(または CSV の KeyFile 列)を指定すると、秘密鍵による公開鍵認証で接続します。
+    鍵のパスフレーズは鍵ファイルごとに 1 回だけ入力します(パスフレーズなしの鍵は Enter のみ)。
+    鍵認証ではログインパスワードが無いため、sudo パスワードは -SudoPassword で指定するか、
+    ユーザーごとに 1 回入力します(空 Enter の場合は NOPASSWD 前提で sudo -n を使用)。
+
     使用例:
         .\collect-EtcData.ps1 -UserName admin
         .\collect-EtcData.ps1 -Credential (Get-Credential) -InputCsvPath .\Targets.csv
         .\collect-EtcData.ps1 -UserName root -NoSudo
+        .\collect-EtcData.ps1 -UserName admin -KeyFile ~\.ssh\id_ed25519
 
     事前に Posh-SSH を導入してください(初回のみ):
         Install-Module Posh-SSH -Scope CurrentUser
@@ -44,6 +50,8 @@ param(
     [string]$LogPath = (Join-Path $PSScriptRoot 'EtcCollect_Check.log'),
     [pscredential]$Credential,
     [string]$UserName,
+    [string]$KeyFile,
+    [securestring]$KeyPassphrase,
     [int]$Port = 22,
     [int]$ConnectionTimeoutSeconds = 15,
     [int]$CommandTimeoutSeconds = 300,
@@ -154,6 +162,44 @@ function Get-HostCredential {
     return $cred
 }
 
+# 鍵認証の資格情報
+# Posh-SSH では -KeyFile 指定時、Credential のパスワード欄が鍵のパスフレーズとして扱われます。
+# パスフレーズは鍵ファイルごとに 1 回だけ入力し(-KeyPassphrase 指定時は入力なし)、以降は再利用します。
+# -Credential のパスワードはログインパスワードとして扱うため、鍵認証ではユーザー名のみ使用します。
+$passphraseCache = @{}
+$sudoPasswordCache = @{}
+
+function Resolve-KeyFilePath {
+    param([string]$Path)
+    # ~ や相対パスをカレントディレクトリ基準のフルパスへ変換
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+function Get-KeyCredential {
+    param([string]$HostName, [string]$RowUserName, [string]$KeyPath)
+    if (-not $RowUserName) {
+        throw ("鍵認証ではユーザー名が必要です。-UserName / -Credential または CSV の UserName 列を指定してください (host={0})。" -f $HostName)
+    }
+    $passphrase = $KeyPassphrase
+    if (-not $passphrase) {
+        $key = $KeyPath.ToLowerInvariant()
+        if (-not $passphraseCache.ContainsKey($key)) {
+            $passphraseCache[$key] = Read-Host -AsSecureString -Prompt ("秘密鍵のパスフレーズを入力してください(パスフレーズなしの場合は Enter) (key={0})" -f $KeyPath)
+        }
+        $passphrase = $passphraseCache[$key]
+    }
+    return (New-Object System.Management.Automation.PSCredential($RowUserName, $passphrase))
+}
+
+function Get-KeyAuthSudoPassword {
+    param([string]$HostName, [string]$RowUserName)
+    $key = $RowUserName.ToLowerInvariant()
+    if (-not $sudoPasswordCache.ContainsKey($key)) {
+        $sudoPasswordCache[$key] = Read-Host -AsSecureString -Prompt ("sudo パスワードを入力してください(NOPASSWD の場合は Enter) (user={0}, host={1})" -f $RowUserName, $HostName)
+    }
+    return $sudoPasswordCache[$key]
+}
+
 # tar 対象パスの分解(/etc → base='/', name='etc')
 $lastSlash = $EtcPath.LastIndexOf('/')
 if ($lastSlash -lt 0 -or $lastSlash -eq ($EtcPath.Length - 1)) {
@@ -175,6 +221,8 @@ META="/tmp/etc_meta_${TS}.txt"
 ARCHIVE="/tmp/etc_collect_${TS}.tar.gz"
 ERRLOG="/tmp/etc_collect_err_${TS}.log"
 echo "CMDIR:$CMDIR"
+echo "METAPATH:$META"
+echo "ERRLOGPATH:$ERRLOG"
 find __ETCPATH__ -exec stat -c '%n|%A|%U|%G|%s|%Y' {} + >"$META" 2>/dev/null
 echo "METAEXIT:$?"
 echo "LOCALTIME:$(readlink __ETCPATH__/localtime 2>/dev/null)" >>"$META"
@@ -187,8 +235,6 @@ if [ -f "$ARCHIVE" ]; then
   echo "SHA256:$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
   echo "FILES:$(tar tzf "$ARCHIVE" 2>/dev/null | wc -l)"
   echo "ARCHIVEPATH:$ARCHIVE"
-  echo "METAPATH:$META"
-  echo "ERRLOGPATH:$ERRLOG"
 fi
 '@
 
@@ -258,20 +304,52 @@ foreach ($target in $targets) {
     if ($target.PSObject.Properties['Port'] -and $target.Port -and $target.Port.Trim() -match '^\d+$') {
         $rowPort = [int]$target.Port.Trim()
     }
-    # ユーザーごとの資格情報(同一ユーザーは最初の 1 回だけ入力)
-    $hostCredential = Get-HostCredential -HostName $computer -RowUserName $rowUserName
+    # CSV の KeyFile 列による行単位の上書き(指定があれば秘密鍵による公開鍵認証)
+    $rowKeyFile = $KeyFile
+    if ($target.PSObject.Properties['KeyFile'] -and $target.KeyFile -and $target.KeyFile.Trim() -ne '') {
+        $rowKeyFile = $target.KeyFile.Trim()
+    }
+    $authMethod = 'password'
+    $keyFileMissing = $false
+    if ($rowKeyFile) {
+        $authMethod = 'key'
+        $rowKeyFile = Resolve-KeyFilePath -Path $rowKeyFile
+        $keyFileMissing = -not (Test-Path -LiteralPath $rowKeyFile -PathType Leaf)
+    }
 
-    # sudo プレフィックス(既定はそのユーザーのログインパスワード。シングルクォートはリモートシェル向けにエスケープ)
-    # ※ echo は dash 系 /bin/sh でバックスラッシュ解釈されるため、解釈されない printf '%s\n' を使用
+    # ユーザーごとの資格情報(同一ユーザーは最初の 1 回だけ入力)
+    # 鍵ファイルが見つからない場合は入力を求めず、下の try 内で失敗として記録する
+    $hostCredential = $null
     $sudoPrefix = ''
-    if (-not $NoSudo) {
-        $sudoSecure = if ($SudoPassword) { $SudoPassword } else { $hostCredential.Password }
-        $plainSudoPw = ConvertTo-PlainText -SecureString $sudoSecure
-        $sudoPrefix = "printf '%s\n' '" + $plainSudoPw.Replace("'", "'\\''") + "' | sudo -S -p '' "
+    if (-not $keyFileMissing) {
+        if ($authMethod -eq 'key') {
+            $hostCredential = Get-KeyCredential -HostName $computer -RowUserName $rowUserName -KeyPath $rowKeyFile
+        }
+        else {
+            $hostCredential = Get-HostCredential -HostName $computer -RowUserName $rowUserName
+        }
+
+        # sudo プレフィックス(既定はそのユーザーのログインパスワード。シングルクォートはリモートシェル向けにエスケープ)
+        # ※ echo は dash 系 /bin/sh でバックスラッシュ解釈されるため、解釈されない printf '%s\n' を使用
+        # 鍵認証ではログインパスワードが無いため、-SudoPassword かユーザーごとの入力値を使用。
+        # 空の場合は NOPASSWD 前提で sudo -n(パスワードを要求されたら待たずに失敗)
+        if (-not $NoSudo) {
+            if ($SudoPassword) { $sudoSecure = $SudoPassword }
+            elseif ($authMethod -eq 'key') { $sudoSecure = Get-KeyAuthSudoPassword -HostName $computer -RowUserName $hostCredential.UserName }
+            else { $sudoSecure = $hostCredential.Password }
+            if ($sudoSecure.Length -eq 0) {
+                $sudoPrefix = 'sudo -n '
+            }
+            else {
+                $plainSudoPw = ConvertTo-PlainText -SecureString $sudoSecure
+                $sudoPrefix = "printf '%s\n' '" + $plainSudoPw.Replace("'", "'\\''") + "' | sudo -S -p '' "
+            }
+        }
     }
 
     $row = [pscustomobject]@{
         ComputerName    = $computer
+        AuthMethod      = $authMethod
         Status          = ''
         ArchiveSizeBytes = ''
         FileCount       = ''
@@ -285,7 +363,9 @@ foreach ($target in $targets) {
         ErrorMessage    = ''
     }
 
-    Write-Log ("処理開始 ({0}/{1}): {2} (user={3}, port={4})" -f $hostIndex, $targets.Count, $computer, $rowUserName, $rowPort)
+    $authLabel = $authMethod
+    if ($authMethod -eq 'key') { $authLabel = 'key:{0}' -f $rowKeyFile }
+    Write-Log ("処理開始 ({0}/{1}): {2} (user={3}, port={4}, auth={5})" -f $hostIndex, $targets.Count, $computer, $rowUserName, $rowPort, $authLabel)
 
     # ローカル保存先ディレクトリ(同名ホストは _2, _3 ... で回避)
     $safeName = Get-SafeFileName -Name $computer
@@ -306,6 +386,19 @@ foreach ($target in $targets) {
     $remoteCmdDir = $null
 
     try {
+        if ($keyFileMissing) {
+            throw ("SSH接続失敗: 秘密鍵ファイルが見つかりません: {0}" -f $rowKeyFile)
+        }
+
+        # SSH / SFTP セッション共通の接続パラメーター(鍵認証時は -KeyFile を追加)
+        $sessionParams = @{
+            ComputerName = $computer
+            Port         = $rowPort
+            Credential   = $hostCredential
+            ErrorAction  = 'Stop'
+        }
+        if ($authMethod -eq 'key') { $sessionParams['KeyFile'] = $rowKeyFile }
+
         # 1) TCP 到達確認(実際に使う SSH ポートを確認)
         if (-not (Test-TcpPort -HostName $computer -TcpPort $rowPort -TimeoutSeconds $ConnectionTimeoutSeconds)) {
             throw ("SSH接続失敗: TCP {0}:{1} へ接続できませんでした(タイムアウト/拒否)。ホスト名・ポート・ファイアウォールを確認してください。" -f $computer, $rowPort)
@@ -313,7 +406,7 @@ foreach ($target in $targets) {
         Write-Log ("SSH通信確認 成功: {0}:{1}" -f $computer, $rowPort)
 
         # 2) SSH ログイン
-        try { $sshSession = New-SSHSession -ComputerName $computer -Port $rowPort -Credential $hostCredential -ErrorAction Stop }
+        try { $sshSession = New-SSHSession @sessionParams }
         catch { throw ('SSH接続失敗: {0}' -f $_.Exception.Message) }
         Write-Log ("SSHログイン 成功: {0}" -f $computer)
 
@@ -352,7 +445,7 @@ foreach ($target in $targets) {
         Write-Log ("アーカイブ作成 成功: {0} ({1} bytes, {2} files)" -f $remoteArchive, $remoteSize, ($remoteFiles -replace '\s', ''))
 
         # 4) SFTP ダウンロード(Posh-SSH 3.2 は SSH セッションの流用に未対応のため別セッションで按続)
-        $sftpSession = New-SFTPSession -ComputerName $computer -Port $rowPort -Credential $hostCredential -ErrorAction Stop
+        $sftpSession = New-SFTPSession @sessionParams
 
         $archiveName = Split-Path -Leaf $remoteArchive
         try {
@@ -423,12 +516,19 @@ foreach ($target in $targets) {
     }
     finally {
         # 7) リモート一時ファイルの削除(ダウンロード成否に関わらず実行)
-        $cleanupTargets = @($remoteArchive, $remoteMeta, $remoteErrLog, $remoteCmdDir) | Where-Object { $_ }
+        # 1 件だけの場合もスカラーにならないよう @() で配列化(StrictMode 下で .Count が失敗するため)
+        $cleanupTargets = @(@($remoteArchive, $remoteMeta, $remoteErrLog, $remoteCmdDir) | Where-Object { $_ })
         if ($sshSession -and $cleanupTargets.Count -gt 0) {
             try {
                 $cleanupList = ($cleanupTargets | ForEach-Object { "'$_'" }) -join ' '
-                $cleanup = $sudoPrefix + 'rm -rf ' + $cleanupList + '; echo "CLEANUPEXIT:$?"'
-                $null = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $cleanup -TimeOut 60
+                # sudo が失敗した場合(パスワード誤り / sudo -n でパスワード要求等)は sudo なしで再試行
+                # (アーカイブ作成前に失敗した場合、残るのは接続ユーザー所有のファイルのみ)
+                $cleanup = $sudoPrefix + 'rm -rf ' + $cleanupList + ' 2>/dev/null || rm -rf ' + $cleanupList + '; echo "CLEANUPEXIT:$?"'
+                $cleanupResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $cleanup -TimeOut 60
+                $cleanupExit = Get-MarkerValue -Text (@($cleanupResult.Output) -join "`n") -Name 'CLEANUPEXIT'
+                if ($cleanupExit -ne '0') {
+                    throw ('rm 終了コード={0} / {1}' -f $cleanupExit, ((@($cleanupResult.Error) -join ' ').Trim()))
+                }
                 $row.RemoteTempCleaned = 'はい'
                 Write-Log ('リモート一時ファイル削除 完了')
             }
