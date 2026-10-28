@@ -301,14 +301,20 @@ foreach ($hostDir in $hostDirs) {
         & $addFinding '高' 'アカウント' 'UID 0 アカウント' ("root 以外の UID 0 アカウントが存在します: {0}" -f $u)
     }
 
-    # /etc/shadow(sudo なしで収集した場合は存在しない)
+    # /etc/shadow(現行の collect はハッシュを除去した etc_shadow_redacted_*.txt を格納。
+    # 旧データは etc/shadow をそのまま参照。sudo なしで収集した場合はどちらも存在しない)
     $shadowCollected = 'いいえ'
     $emptyPasswordAccounts = @()
     $lockedAccountCount = 0
     $noAgingAccounts = @()
     $shadowPath = Join-Path $etcDir 'shadow'
+    $shadowLabel = 'はい'
+    if (-not (Test-Path -LiteralPath $shadowPath)) {
+        $redacted = Get-ChildItem -Path $hostDir.FullName -Filter 'etc_shadow_redacted_*.txt' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($redacted) { $shadowPath = $redacted.FullName; $shadowLabel = 'はい(ハッシュ除去)' }
+    }
     if (Test-Path -LiteralPath $shadowPath) {
-        $shadowCollected = 'はい'
+        $shadowCollected = $shadowLabel
         foreach ($line in (Read-Lines -Path $shadowPath)) {
             $t = $line.Trim()
             if ($t -eq '' -or $t.StartsWith('#')) { continue }

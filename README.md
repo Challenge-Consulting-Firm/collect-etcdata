@@ -67,13 +67,33 @@ powershell -ExecutionPolicy Bypass -File .\collect-EtcData.ps1 -UserName admin
 入力 CSV に列挙したサーバーに対して、次の処理を順に実行します。
 
 1. **SSH 通信確認** — 対象ポートへの TCP 到達確認(実際に使う通信を確認)
-2. **リモートでアーカイブ作成** — `/etc` 配下を `tar.gz` 化。あわせてパーミッション・所有者のメタデータ(`etc_meta_*.txt`)と **コマンドレポート**(`commands/`)も取得
+2. **リモートでアーカイブ作成** — `/etc` 配下を `tar.gz` 化。あわせてパーミッション・所有者のメタデータ(`etc_meta_*.txt`)と **コマンドレポート**(`commands/`)も取得。
+   機密ファイルとサイズ上限超過ファイルは除外し、テキストファイルを指すシンボリックリンクはリンク先の中身で格納(後述「収集対象の調整」)
 3. **SFTP ダウンロード** — 作成した `tar.gz` をローカルへ取得(SHA256 で整合性確認)
 4. **ローカル展開** — Windows 標準の `tar`(bsdtar)で展開
-5. **リモート一時ファイル削除** — `/tmp` に作成した一時ファイルをクリーンアップ
+5. **リモート一時ファイル削除** — `/tmp/etc_collect_<日時>/`(パーミッション 700)に作成した一時ファイルをディレクトリごと削除
 6. **結果出力** — 取得結果を CSV に、処理経過をログに出力
 
 通信不可・取得失敗のサーバーもスキップせず、失敗理由付きで結果行に記録します。
+
+### 収集対象の調整(機密ファイル除外・サイズ上限・シンボリックリンク)
+
+リモート側で `/etc` 配下のファイルを分類し、次のとおり扱います。除外したファイルは
+`etc_excluded_<日時>.txt`(`理由|パス`)に記録され、パーミッション等は `etc_meta_*.txt` に残ります。
+
+| 対象 | 扱い | 記録される理由 |
+| --- | --- | --- |
+| `shadow` / `shadow-` / `shadow.*` / `gshadow` / `gshadow-` / `gshadow.*` / `opasswd` / `*.keytab` / `*.p12` / `*.pfx` / `*.jks` / `*.keystore` / `key3.db` / `key4.db`(ファイル名で判定。シンボリックリンクはリンク名とリンク先の両方で判定) | 収集しない | `secret-name` |
+| パスワードハッシュ行(`ユーザー:$6$...` 形式。shadow の退避コピーや htpasswd 等。中身で判定) | 収集しない | `secret-password-hash` |
+| PEM 形式の秘密鍵(`-----BEGIN ... PRIVATE KEY-----` を含むファイル。SSH ホスト鍵、`*.key`、`*-key.pem`、`private.key.2025` のような退避ファイル等。中身で判定) | 収集しない | `secret-private-key` |
+| `-MaxFileSizeMB`(既定 1MB)を超えるファイル(`udev/hwdb.bin`、SELinux ポリシー、`/etc` 配下に置かれたバックアップ等) | 収集しない | `size-over(<bytes> bytes)` |
+| テキストファイルを指すシンボリックリンク(`os-release`、`*.wants/*.service` 等) | リンク先の中身を通常ファイルとして格納 | (記録なし。件数は `DerefSymlinkCount`) |
+| ディレクトリ・バイナリ・リンク切れ・`/proc` 等を指すリンク、上記で除外対象になったリンク | リンクのまま格納 | 除外対象のリンクは `(symlink-kept)` 付き |
+
+- `/etc/shadow` はパスワードハッシュを `REDACTED` に置き換えた `etc_shadow_redacted_<日時>.txt` だけを格納します
+  (空パスワード・ロック状態 `!` `*`・有効期限などのフィールドはそのまま残るため、解析は従来どおり可能です)。
+- DER 形式(バイナリ)の秘密鍵は中身で判定できません。拡張子で判定できないものが置かれている環境では、`etc_meta_*.txt` で確認してください。
+- 実体化したリンクのパーミッション・所有者はリンク先のものになります。リンク自体の情報(リンク先パス)は `etc_meta_*.txt` の最終列で確認できます。
 
 ### コマンドレポート(/etc 以外の設定情報)
 
@@ -165,8 +185,9 @@ $pp = Read-Host -AsSecureString '鍵のパスフレーズ'
 | `-ConnectionTimeoutSeconds` | `15` | TCP 接続確認のタイムアウト秒。 |
 | `-CommandTimeoutSeconds` | `300` | リモートコマンド(tar 等)のタイムアウト秒。 |
 | `-EtcPath` | `/etc` | 取得対象ディレクトリ。 |
+| `-MaxFileSizeMB` | `1` | これを超えるファイルは収集しない(`0` で無制限)。除外したファイルは `etc_excluded_*.txt` に記録。 |
 | `-NoCommandReport` | (off) | コマンドレポート(commands/)の収集をスキップ。 |
-| `-NoSudo` | (off) | sudo を使わない(root 直接ログイン時、または機密ファイルを意図的に除外する場合)。 |
+| `-NoSudo` | (off) | sudo を使わない(root 直接ログイン時など)。読み取り権限のないファイルは収集されません。 |
 | `-SudoPassword` | (ログインと同じ) | sudo パスワードが別の場合に指定。鍵認証時は未指定ならユーザーごとに入力(空なら `sudo -n`)。 |
 | `-KeepArchive` | (off) | tar.gz を展開後も保持(既定は展開後に削除。展開警告時は自動的に保持)。 |
 
@@ -177,7 +198,7 @@ $pp = Read-Host -AsSecureString '鍵のパスフレーズ'
 | 通常(sudo にパスワードあり) | (既定) | `sudo -S`。既定で **そのユーザーのログインパスワード** を使用。パスワードは `printf '%s\n'` 経由のため `ps` に出ず、`echo` のバックスラッシュ解釈(dash 系 /bin/sh)の影響も受けません。 |
 | sudo パスワードが別 | `-SudoPassword <SecureString>` | 全ホスト共通の sudo パスワードを指定。 |
 | 鍵認証 + NOPASSWD sudo | (sudo パスワード入力で空 Enter) | `sudo -n`。パスワードを要求された場合は待たずに失敗します。 |
-| root で直接ログイン / 機密ファイル除外 | `-NoSudo` | sudo を使わない。`/etc/shadow` 等の読み取り不可ファイルは一部欠けた状態で収集されます。 |
+| root で直接ログイン | `-NoSudo` | sudo を使わない。読み取り不可のファイル・ディレクトリは一部欠けた状態で収集されます(メタデータも同様)。 |
 
 ### 出力
 
@@ -186,7 +207,9 @@ EtcCollected_<日時>/
   ├─ <ComputerName>/
   │   ├─ etc/...                        # 展開済み /etc の中身
   │   ├─ commands/*.txt                 # コマンド収集レポート(hostnamectl / ip / systemctl 等)
-  │   ├─ etc_meta_<日時>.txt            # パス|パーミッション|所有者|サイズ|mtime(+LOCALTIME 行)
+  │   ├─ etc_meta_<日時>.txt            # パス|パーミッション|所有者|グループ|サイズ|mtime(エポック秒)|リンク先(+LOCALTIME 行)
+  │   ├─ etc_excluded_<日時>.txt        # 収集から除外したファイル(理由|パス)
+  │   ├─ etc_shadow_redacted_<日時>.txt # パスワードハッシュを除去した /etc/shadow(sudo 収集時のみ)
   │   └─ etc_collect_<日時>.tar.gz      # ダウンロードしたアーカイブ(既定は展開後に削除。保持は -KeepArchive)
   └─ EtcCollectResult.csv               # 取得結果
 ```
@@ -201,15 +224,16 @@ EtcCollected_<日時>/
 | `ArchiveSizeBytes` / `FileCount` / `Sha256` | アーカイブサイズ / ファイル数 / ハッシュ |
 | `LocalEtcPath` / `LocalArchivePath` / `LocalMetadataPath` | ローカルの保存先 |
 | `LocalCommandsPath` / `CommandFileCount` | コマンドレポートの保存先 / ファイル数 |
+| `DerefSymlinkCount` | リンク先の中身で格納したシンボリックリンクの数 |
+| `ExcludedSecretCount` / `ExcludedLargeCount` | 機密ファイル / サイズ上限超過として除外した数(内訳は `etc_excluded_*.txt`) |
 | `RemoteTempCleaned` | リモート一時ファイルを削除したか(`はい` / `いいえ`) |
 | `ErrorMessage` | 失敗理由・警告(tar 一部読み取り不可、展開時の警告など) |
 
 ログは `[日時] [レベル] メッセージ` 形式(`INFO` / `WARN` / `ERROR`)。
 
-> **セキュリティ上の注意:** 既定(sudo)では `/etc/shadow` や SSH ホスト鍵などの機密ファイルも収集されます。
-> `tar.gz`・展開フォルダーには機密情報が含まれるため、保管場所のアクセス制御と解析後の削除を必ず行ってください。
+> **セキュリティ上の注意:** `/etc/shadow`(ハッシュ)・SSH ホスト鍵・TLS 秘密鍵などは収集から除外されますが、
+> 設定ファイル内に直接書かれたパスワード・トークン等は除外されません。保管場所のアクセス制御と解析後の削除を必ず行ってください。
 > アーカイブは既定で展開後に削除されます(保持する場合は `-KeepArchive`。SHA256 は `EtcCollectResult.csv` に記録されます)。
-> 機密ファイルが不要な場合は `-NoSudo` を指定してください。
 
 ## analyze-EtcData.ps1(解析)
 
@@ -230,7 +254,7 @@ EtcCollected_<日時>/
 | DNS | resolv.conf の nameserver / search。`127.0.0.53`(systemd-resolved スタブ)を検出 | 情報 |
 | hosts / fstab | hosts エントリ(localhost 以外)、マウント数、NFS マウント | -(列のみ) |
 | アカウント | root 以外の UID 0 アカウント | **高** |
-| アカウント | 空パスワード(shadow のパスワードフィールドが空) | **高** |
+| アカウント | 空パスワード(shadow のパスワードフィールドが空。`etc_shadow_redacted_*.txt`、旧データは `etc/shadow` を参照) | **高** |
 | アカウント | パスワード有効期限が無期限(max=99999 / 空) | 低 |
 | アカウント | ロックアカウント数、wheel/sudo グループのメンバー、ログイン可能シェル数 | -(列のみ) |
 | アカウント | shadow 未収集(sudo なし収集) | 低 |
@@ -258,7 +282,8 @@ EtcCollected_<日時>/
 
 - Windows 上に展開した場合、ファイルのパーミッション / 所有者情報は失われるため、
   それらは collect 時に取得した `etc_meta_*.txt` を参照してください。
-- `/etc/localtime` 等のシンボリックリンクは、Windows 展開時に警告が出ることがあります(展開自体は継続)。
+- テキストファイルを指すシンボリックリンクは収集時に実体化されます。`/etc/localtime` などリンクのまま格納されたものは、
+  Windows 展開時に警告が出ることがあります(展開自体は継続。リンク先は `etc_meta_*.txt` で確認できます)。
 - SSH の `Include` に相対パス・特殊トークン(`%h` 等)が使われている場合は近似解釈になります。
 
 ## 検証環境(鍵認証の接続試験用 SSH コンテナ)
@@ -305,7 +330,7 @@ docker cp etc-sshlab:/lab/keys .\test\sshlab\keys
 | sudo パスワード (user=keypp) | `SudoPass#1` |
 
 ```powershell
-# 結果確認(3 行とも Status=成功 / AuthMethod=key。sudo が効いていれば etc/shadow も取得される)
+# 結果確認(3 行とも Status=成功 / AuthMethod=key。sudo が効いていれば etc_shadow_redacted_*.txt も取得される)
 Import-Csv .\EtcCollected_<日時>\EtcCollectResult.csv | Format-Table ComputerName,AuthMethod,Status,FileCount,RemoteTempCleaned,ErrorMessage -AutoSize
 ```
 
@@ -344,6 +369,8 @@ Remove-Item -Recurse .\test\sshlab\keys          # 取り出した鍵の削除
 | 鍵認証で `Invalid private key file` 等 | パスフレーズ誤り、または未対応の鍵形式。`ssh-keygen -p -m PEM -f <鍵>` で PEM 形式に変換すると解消する場合があります。 |
 | `sudo: a password is required` / sudo 失敗 | `-SudoPassword` で別パスワードを指定、または `-NoSudo`。鍵認証で sudo パスワードを空にした場合は NOPASSWD 設定を確認。 |
 | `tar コマンドが見つかりません` | Windows 10 1803+ / Windows Server 1809+ を使用、または tar を PATH へ。 |
-| `アーカイブ作成失敗` | 対象が BusyBox 系で `stat`/`sha256sum` が無い可能性(メタデータ取得失敗は継続可)。TAREXIT と ERRSUMMARY をログで確認。 |
+| `アーカイブ作成失敗` | `TAREXIT=sudo` の場合は sudo の失敗(パスワード誤り等)。それ以外は対象が BusyBox 系で `find -printf`/`sha256sum` が無い可能性(メタデータ取得失敗は継続可)。TAREXIT と ERRSUMMARY をログで確認。 |
+| `メタデータ取得で一部エラー` | `-NoSudo` で読み取れないディレクトリがあった、または `find -printf` 非対応。 |
+| 必要なファイルが収集されていない | `etc_excluded_*.txt` を確認。サイズ上限超過なら `-MaxFileSizeMB` を引き上げて再収集(`0` で無制限)。 |
 | 分析CSV に shadow 由来の列が埋まらない | `-NoSudo` で収集した可能性。sudo 付きで再収集してください。 |
 | 実行ポリシーで起動不可 | `powershell -ExecutionPolicy Bypass -File ...` |

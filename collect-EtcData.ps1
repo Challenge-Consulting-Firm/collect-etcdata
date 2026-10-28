@@ -6,9 +6,9 @@
 .DESCRIPTION
     対象サーバー一覧(CSV)を読み込み、各サーバーへ SSH(Posh-SSH モジュール)で接続して
     /etc 配下を tar.gz アーカイブ化 → SFTP でダウンロード → ローカルへ展開します。
-    あわせて /etc のメタデータ(パス・パーミッション・所有者)を etc_meta_*.txt として収集します。
+    あわせて /etc のメタデータ(パス・パーミッション・所有者・リンク先)を etc_meta_*.txt として収集します。
 
-    リモート側は /tmp 直下に一時ファイルを作成するだけで、既存のファイルは一切変更しません
+    リモート側は /tmp/etc_collect_<日時>/ に一時ファイルを作成するだけで、既存のファイルは一切変更しません
     (終了後に一時ファイルを削除します)。
     /etc 以外の設定情報(カーネル/ネットワーク/サービス/パッケージ/ファイアウォール等)は
     コマンド出力として commands/ フォルダーに収集します(-NoCommandReport でスキップ可)。
@@ -18,12 +18,19 @@
           ├─ <ComputerName>/etc/...                  # 展開済み /etc の中身
           ├─ <ComputerName>/commands/...             # コマンド収集レポート(hostnamectl / ip / systemctl / resolvectl 等)
           ├─ <ComputerName>/etc_meta_<日時>.txt      # パーミッション等のメタデータ
+          ├─ <ComputerName>/etc_excluded_<日時>.txt  # 収集から除外したファイル(理由|パス)
+          ├─ <ComputerName>/etc_shadow_redacted_<日時>.txt # パスワードハッシュを除去した /etc/shadow
           ├─ <ComputerName>/etc_collect_<日時>.tar.gz # ダウンロードしたアーカイブ(既定は展開後に削除。-KeepArchive で保持)
           └─ EtcCollectResult.csv                    # 取得結果(CSV)
 
-    既定では sudo を使って /etc/shadow や SSH ホスト鍵などの機密ファイルも収集します。
-    アーカイブには機密情報が含まれるため、保管・取り扱いには十分注意してください。
-    機密ファイルが不要な場合は -NoSudo を指定してください(読み取り可能なファイルのみ収集)。
+    既定では sudo を使って読み取り制限のあるファイルも収集しますが、次のファイルは収集しません
+    (除外したファイルは etc_excluded_*.txt に記録)。
+      - shadow / gshadow / opasswd / keytab / 鍵ストア(ファイル名で判定)
+      - PEM 形式の秘密鍵を含むファイル(SSH ホスト鍵・TLS 秘密鍵など。中身で判定)
+      - -MaxFileSizeMB(既定 1MB)を超えるファイル
+    /etc/shadow はパスワードハッシュを除去した etc_shadow_redacted_*.txt のみ格納します。
+    テキストファイルを指すシンボリックリンクは、リンク先の中身を通常ファイルとして格納します
+    (Windows で展開するとリンクの中身が失われるため)。
 
     CSV の UserName 列に複数のユーザーが混在する場合、ユーザーごとに 1 回ずつ
     パスワードを入力します(同一ユーザーは最初の 1 回のみ)。sudo パスワードは既定で
@@ -56,6 +63,7 @@ param(
     [int]$ConnectionTimeoutSeconds = 15,
     [int]$CommandTimeoutSeconds = 300,
     [string]$EtcPath = '/etc',
+    [int]$MaxFileSizeMB = 1,
     [switch]$NoCommandReport,
     [securestring]$SudoPassword,
     [switch]$NoSudo,
@@ -209,27 +217,88 @@ $tarBase = $EtcPath.Substring(0, $lastSlash)
 if (-not $tarBase) { $tarBase = '/' }
 $tarName = $EtcPath.Substring($lastSlash + 1)
 
+if ($MaxFileSizeMB -lt 0) { throw "MaxFileSizeMB が不正です: $MaxFileSizeMB (0 で無制限)" }
+$maxBytes = [long]$MaxFileSizeMB * 1MB
+
 # リモートで実行するシェルスクリプトのテンプレート
-#   - メタデータ(stat)は一般ユーザーで取得(メタ情報の参照に root は不要)
-#   - tar は __SUDOPREFIX__ 付きで実行(既定 sudo。/etc/shadow 等も収集)
+#   - 一時ファイルはすべて /tmp/etc_collect_<日時>/(パーミッション 700)に作成し、終了後にディレクトリごと削除
+#   - メタデータ・ファイル分類・tar は __SUDOPREFIX__ 付きで実行(既定 sudo。読み取り制限のあるディレクトリも対象)
+#   - メタデータは find -printf で取得(パス|パーミッション|所有者|グループ|サイズ|mtime|リンク先)
+#   - ファイル分類(classify.txt。1 行 = 種別|L(リンク)/F(ファイル)|理由|パス):
+#       S = 機密(shadow 系・鍵ストア等のファイル名、または PEM 秘密鍵を含む)→ 収集しない
+#       B = サイズ上限超過 → 収集しない
+#       D = テキストファイルを指すシンボリックリンク → リンク先の中身で格納(tar --dereference)
+#     S/B に該当したシンボリックリンクと、ディレクトリ・バイナリ・リンク切れのリンクはリンクのまま格納
+#   - /etc/shadow はパスワードハッシュを REDACTED に置換した etc_shadow_redacted_<日時>.txt のみ格納
 #   - パスワードは printf '%s\n' 経由のため ps に出ず、シェルのエスケープ解釈(echo の \ 問題)も受けない
 $payloadTemplate = @'
 set -u
 TS=$(date +%Y%m%d_%H%M%S)
-CMDIR="/tmp/etc_cmds_${TS}"
-META="/tmp/etc_meta_${TS}.txt"
-ARCHIVE="/tmp/etc_collect_${TS}.tar.gz"
-ERRLOG="/tmp/etc_collect_err_${TS}.log"
-echo "CMDIR:$CMDIR"
+WORK="/tmp/etc_collect_${TS}"
+CMDIR="$WORK"
+META="$WORK/etc_meta_${TS}.txt"
+EXCL="$WORK/etc_excluded_${TS}.txt"
+SHADOWRED="$WORK/etc_shadow_redacted_${TS}.txt"
+CLASSIFY="$WORK/classify.txt"
+TARFILE="$WORK/etc_collect_${TS}.tar"
+ARCHIVE="$WORK/etc_collect_${TS}.tar.gz"
+ERRLOG="$WORK/tar_err.log"
+mkdir -m 700 "$WORK" || { echo "ERRSUMMARY:mkdir failed: $WORK"; exit 0; }
+echo "WORKDIR:$WORK"
 echo "METAPATH:$META"
-echo "ERRLOGPATH:$ERRLOG"
-find __ETCPATH__ -exec stat -c '%n|%A|%U|%G|%s|%Y' {} + >"$META" 2>/dev/null
+if ! __SUDOPREFIX__true 2>"$ERRLOG"; then
+  echo "TAREXIT:sudo"
+  echo "ERRSUMMARY:$(head -c 300 "$ERRLOG" 2>/dev/null | tr '\n' ' ')"
+  exit 0
+fi
+__SUDOPREFIX__find __ETCPATH__ -printf '%p|%M|%u|%g|%s|%T@|%l\n' >"$META" 2>"$WORK/meta_err.log"
 echo "METAEXIT:$?"
 echo "LOCALTIME:$(readlink __ETCPATH__/localtime 2>/dev/null)" >>"$META"
+cd "__TARBASE__" || exit 0
+__SUDOPREFIX__find "__TARNAME__" \( -type f -o -type l \) -exec sh -c '
+max=$1; shift
+for p in "$@"; do
+  if [ -L "$p" ]; then
+    [ -f "$p" ] || continue
+    t=$(readlink -f "$p")
+    case "$t" in ""|/proc/*|/sys/*|/dev/*) continue ;; esac
+    k=L
+  else
+    t=$p; k=F
+  fi
+  secret=
+  for n in "${p##*/}" "${t##*/}"; do
+    case "$n" in
+      shadow|shadow-|shadow.*|gshadow|gshadow-|gshadow.*|opasswd|*.keytab|*.p12|*.pfx|*.jks|*.keystore|key3.db|key4.db) secret=1 ;;
+    esac
+  done
+  if [ -n "$secret" ]; then echo "S|$k|secret-name|$p"; continue; fi
+  s=$(stat -c %s "$t" 2>/dev/null) || s=0
+  if [ "$max" -gt 0 ] && [ "$s" -gt "$max" ]; then echo "B|$k|size-over($s bytes)|$p"; continue; fi
+  if grep -qIE -e "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" "$t" 2>/dev/null; then echo "S|$k|secret-private-key|$p"; continue; fi
+  if grep -qE -e "^[^:]+:[!*]?\\\$[0-9a-z]+\\\$" "$t" 2>/dev/null; then echo "S|$k|secret-password-hash|$p"; continue; fi
+  if [ "$k" = L ] && grep -qI . "$t" 2>/dev/null; then echo "D|L|deref|$p"; fi
+done' sh __MAXBYTES__ {} + >"$CLASSIFY" 2>/dev/null
+sed -n -e 's/^[SB]|F|[^|]*|//p' -e 's/^D|L|[^|]*|//p' "$CLASSIFY" >"$WORK/exclude.lst"
+sed -n -e 's/^D|L|[^|]*|//p' "$CLASSIFY" >"$WORK/deref.lst"
+sed -n -e 's/^[SB]|F|//p' -e 's/^[SB]|L|\([^|]*\)|/\1(symlink-kept)|/p' "$CLASSIFY" >"$EXCL"
+__SUDOPREFIX__awk -F: 'BEGIN { OFS = ":" } { p = $2; if (p != "" && p !~ /^[!*]+$/) { if (p ~ /^[!*]/) p = substr(p, 1, 1) "REDACTED"; else p = "REDACTED" } $2 = p; print }' "__ETCPATH__/shadow" >"$SHADOWRED" 2>/dev/null
+[ -s "$SHADOWRED" ] || rm -f "$SHADOWRED"
 __COMMANDBLOCK__
-__SUDOPREFIX__tar czf "$ARCHIVE" -C "__TARBASE__" "__TARNAME__" __CMDIRTARARG__ -C /tmp "$(basename "$META")" 2>"$ERRLOG"
-echo "TAREXIT:$?"
+TAREXIT=0
+__SUDOPREFIX__tar cf "$TARFILE" --anchored --no-wildcards --exclude-from="$WORK/exclude.lst" -C "__TARBASE__" "__TARNAME__" 2>"$ERRLOG" || TAREXIT=$?
+if [ -s "$WORK/deref.lst" ]; then
+  __SUDOPREFIX__tar rf "$TARFILE" --dereference --no-recursion -C "__TARBASE__" -T "$WORK/deref.lst" 2>>"$ERRLOG" || TAREXIT=$?
+fi
+set -- "$(basename "$META")" "$(basename "$EXCL")"
+[ -f "$SHADOWRED" ] && set -- "$@" "$(basename "$SHADOWRED")"
+__SUDOPREFIX__tar rf "$TARFILE" __CMDIRTARARG__ -C "$WORK" "$@" 2>>"$ERRLOG" || TAREXIT=$?
+gzip -c "$TARFILE" >"$ARCHIVE" 2>>"$ERRLOG" || { TAREXIT=$?; rm -f "$ARCHIVE"; }
+echo "TAREXIT:$TAREXIT"
 echo "ERRSUMMARY:$(head -c 300 "$ERRLOG" 2>/dev/null | tr '\n' ' ')"
+echo "DEREFCOUNT:$(grep -c '^D|' "$CLASSIFY")"
+echo "SECRETCOUNT:$(grep -c '^S|' "$CLASSIFY")"
+echo "LARGECOUNT:$(grep -c '^B|' "$CLASSIFY")"
 if [ -f "$ARCHIVE" ]; then
   echo "SIZE:$(stat -c %s "$ARCHIVE")"
   echo "SHA256:$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
@@ -359,6 +428,9 @@ foreach ($target in $targets) {
         LocalMetadataPath = ''
         LocalCommandsPath = ''
         CommandFileCount = ''
+        DerefSymlinkCount = ''
+        ExcludedSecretCount = ''
+        ExcludedLargeCount = ''
         RemoteTempCleaned = ''
         ErrorMessage    = ''
     }
@@ -382,8 +454,7 @@ foreach ($target in $targets) {
     $sftpSession = $null
     $remoteArchive = $null
     $remoteMeta = $null
-    $remoteErrLog = $null
-    $remoteCmdDir = $null
+    $remoteWorkDir = $null
 
     try {
         if ($keyFileMissing) {
@@ -411,7 +482,7 @@ foreach ($target in $targets) {
         Write-Log ("SSHログイン 成功: {0}" -f $computer)
 
         # 3) リモートでアーカイブ作成(+メタデータ取得)
-        $payload = $payloadTemplate.Replace('__COMMANDBLOCK__', $commandBlock).Replace('__CMDIRTARARG__', $cmdirTarArg).Replace('__SUDOPREFIX__', $sudoPrefix).Replace('__ETCPATH__', $EtcPath).Replace('__TARBASE__', $tarBase).Replace('__TARNAME__', $tarName)
+        $payload = $payloadTemplate.Replace('__COMMANDBLOCK__', $commandBlock).Replace('__MAXBYTES__', [string]$maxBytes).Replace('__CMDIRTARARG__', $cmdirTarArg).Replace('__SUDOPREFIX__', $sudoPrefix).Replace('__ETCPATH__', $EtcPath).Replace('__TARBASE__', $tarBase).Replace('__TARNAME__', $tarName)
         $payload = $payload -replace "`r", ''   # Windows で実行した場合の CR 混入対策
 
         $result = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $payload -TimeOut $CommandTimeoutSeconds
@@ -420,14 +491,16 @@ foreach ($target in $targets) {
 
         $remoteArchive = Get-MarkerValue -Text $stdout -Name 'ARCHIVEPATH'
         $remoteMeta    = Get-MarkerValue -Text $stdout -Name 'METAPATH'
-        $remoteErrLog  = Get-MarkerValue -Text $stdout -Name 'ERRLOGPATH'
-        $remoteCmdDir  = Get-MarkerValue -Text $stdout -Name 'CMDIR'
+        $remoteWorkDir = Get-MarkerValue -Text $stdout -Name 'WORKDIR'
         $remoteSha256  = Get-MarkerValue -Text $stdout -Name 'SHA256'
         $remoteSize    = Get-MarkerValue -Text $stdout -Name 'SIZE'
         $remoteFiles   = Get-MarkerValue -Text $stdout -Name 'FILES'
         $tarExit       = Get-MarkerValue -Text $stdout -Name 'TAREXIT'
         $metaExit      = Get-MarkerValue -Text $stdout -Name 'METAEXIT'
         $errSummary    = Get-MarkerValue -Text $stdout -Name 'ERRSUMMARY'
+        $row.DerefSymlinkCount   = Get-MarkerValue -Text $stdout -Name 'DEREFCOUNT'
+        $row.ExcludedSecretCount = Get-MarkerValue -Text $stdout -Name 'SECRETCOUNT'
+        $row.ExcludedLargeCount  = Get-MarkerValue -Text $stdout -Name 'LARGECOUNT'
 
         if (-not $remoteArchive) {
             $detail = $errSummary
@@ -435,14 +508,15 @@ foreach ($target in $targets) {
             throw ('アーカイブ作成失敗: リモート側で tar.gz が作成されませんでした。TAREXIT={0} / 詳細: {1}' -f $tarExit, $detail)
         }
         if ($metaExit -and $metaExit -ne '0') {
-            Write-Log ("WARN: メタデータ取得に失敗(BusyBox 等の stat 非対応の可能性): {0}" -f $computer) 'WARN'
-            $row.ErrorMessage = 'メタデータ取得失敗(stat 非対応の可能性)。'
+            Write-Log ("WARN: メタデータ取得で一部エラー(find 終了コード={0}。BusyBox 等の find -printf 非対応の可能性): {1}" -f $metaExit, $computer) 'WARN'
+            $row.ErrorMessage = ('メタデータ取得で一部エラー(find 終了コード={0})。' -f $metaExit)
         }
         if ($tarExit -and $tarExit -ne '0') {
             Write-Log ("WARN: tar が終了コード {0} で完了(一部ファイル読み取り不可の可能性): {1} / {2}" -f $tarExit, $computer, $errSummary) 'WARN'
             $row.ErrorMessage += ("tar終了コード={0}(一部未収集の可能性)。" -f $tarExit)
         }
         Write-Log ("アーカイブ作成 成功: {0} ({1} bytes, {2} files)" -f $remoteArchive, $remoteSize, ($remoteFiles -replace '\s', ''))
+        Write-Log ("収集除外: 機密={0} / サイズ上限超過={1} (上限 {2} MB。一覧は etc_excluded_*.txt) / リンク実体化={3}" -f $row.ExcludedSecretCount, $row.ExcludedLargeCount, $MaxFileSizeMB, $row.DerefSymlinkCount)
 
         # 4) SFTP ダウンロード(Posh-SSH 3.2 は SSH セッションの流用に未対応のため別セッションで按続)
         $sftpSession = New-SFTPSession @sessionParams
@@ -465,9 +539,6 @@ foreach ($target in $targets) {
         $row.ArchiveSizeBytes = $remoteSize
         $row.FileCount = ($remoteFiles -replace '\s', '')
         $row.LocalArchivePath = $localArchive
-        $metaName = Split-Path -Leaf $remoteMeta
-        $localMeta = Join-Path $hostDir $metaName
-        if (Test-Path -LiteralPath $localMeta) { $row.LocalMetadataPath = $localMeta }
         Write-Log ('整合性確認 成功 (SHA256 一致)')
 
         # 6) ローカル展開(Windows 標準の bsdtar を使用)
@@ -481,6 +552,12 @@ foreach ($target in $targets) {
             $row.ErrorMessage += '展開時に警告(シンボリックリンク等)。'
         }
         Write-Log ('ローカル展開 成功')
+
+        # メタデータ(アーカイブ直下に格納されているため展開後に確認)
+        if ($remoteMeta) {
+            $localMeta = Join-Path $hostDir (Split-Path -Leaf $remoteMeta)
+            if (Test-Path -LiteralPath $localMeta) { $row.LocalMetadataPath = $localMeta }
+        }
 
         # コマンドレポートの確認
         $commandsPath = Join-Path $hostDir 'commands'
@@ -517,7 +594,7 @@ foreach ($target in $targets) {
     finally {
         # 7) リモート一時ファイルの削除(ダウンロード成否に関わらず実行)
         # 1 件だけの場合もスカラーにならないよう @() で配列化(StrictMode 下で .Count が失敗するため)
-        $cleanupTargets = @(@($remoteArchive, $remoteMeta, $remoteErrLog, $remoteCmdDir) | Where-Object { $_ })
+        $cleanupTargets = @(@($remoteWorkDir) | Where-Object { $_ })
         if ($sshSession -and $cleanupTargets.Count -gt 0) {
             try {
                 $cleanupList = ($cleanupTargets | ForEach-Object { "'$_'" }) -join ' '
