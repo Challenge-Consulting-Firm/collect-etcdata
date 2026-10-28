@@ -266,13 +266,17 @@ for p in "$@"; do
   else
     t=$p; k=F
   fi
-  case "${p##*/}" in
-    shadow|shadow-|gshadow|gshadow-|opasswd|*.keytab|*.p12|*.pfx|*.jks|*.keystore|key3.db|key4.db)
-      echo "S|$k|secret-name|$p"; continue ;;
-  esac
+  secret=
+  for n in "${p##*/}" "${t##*/}"; do
+    case "$n" in
+      shadow|shadow-|shadow.*|gshadow|gshadow-|gshadow.*|opasswd|*.keytab|*.p12|*.pfx|*.jks|*.keystore|key3.db|key4.db) secret=1 ;;
+    esac
+  done
+  if [ -n "$secret" ]; then echo "S|$k|secret-name|$p"; continue; fi
   s=$(stat -c %s "$t" 2>/dev/null) || s=0
   if [ "$max" -gt 0 ] && [ "$s" -gt "$max" ]; then echo "B|$k|size-over($s bytes)|$p"; continue; fi
   if grep -qIE -e "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" "$t" 2>/dev/null; then echo "S|$k|secret-private-key|$p"; continue; fi
+  if grep -qE -e "^[^:]+:[!*]?\\\$[0-9a-z]+\\\$" "$t" 2>/dev/null; then echo "S|$k|secret-password-hash|$p"; continue; fi
   if [ "$k" = L ] && grep -qI . "$t" 2>/dev/null; then echo "D|L|deref|$p"; fi
 done' sh __MAXBYTES__ {} + >"$CLASSIFY" 2>/dev/null
 sed -n -e 's/^[SB]|F|[^|]*|//p' -e 's/^D|L|[^|]*|//p' "$CLASSIFY" >"$WORK/exclude.lst"

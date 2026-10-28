@@ -83,7 +83,8 @@ powershell -ExecutionPolicy Bypass -File .\collect-EtcData.ps1 -UserName admin
 
 | 対象 | 扱い | 記録される理由 |
 | --- | --- | --- |
-| `shadow` / `shadow-` / `gshadow` / `gshadow-` / `opasswd` / `*.keytab` / `*.p12` / `*.pfx` / `*.jks` / `*.keystore` / `key3.db` / `key4.db`(ファイル名で判定) | 収集しない | `secret-name` |
+| `shadow` / `shadow-` / `shadow.*` / `gshadow` / `gshadow-` / `gshadow.*` / `opasswd` / `*.keytab` / `*.p12` / `*.pfx` / `*.jks` / `*.keystore` / `key3.db` / `key4.db`(ファイル名で判定。シンボリックリンクはリンク名とリンク先の両方で判定) | 収集しない | `secret-name` |
+| パスワードハッシュ行(`ユーザー:$6$...` 形式。shadow の退避コピーや htpasswd 等。中身で判定) | 収集しない | `secret-password-hash` |
 | PEM 形式の秘密鍵(`-----BEGIN ... PRIVATE KEY-----` を含むファイル。SSH ホスト鍵、`*.key`、`*-key.pem`、`private.key.2025` のような退避ファイル等。中身で判定) | 収集しない | `secret-private-key` |
 | `-MaxFileSizeMB`(既定 1MB)を超えるファイル(`udev/hwdb.bin`、SELinux ポリシー、`/etc` 配下に置かれたバックアップ等) | 収集しない | `size-over(<bytes> bytes)` |
 | テキストファイルを指すシンボリックリンク(`os-release`、`*.wants/*.service` 等) | リンク先の中身を通常ファイルとして格納 | (記録なし。件数は `DerefSymlinkCount`) |
