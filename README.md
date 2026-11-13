@@ -182,7 +182,7 @@ $pp = Read-Host -AsSecureString '鍵のパスフレーズ'
 | `-Credential` / `-UserName` / `-Port` | (実行時入力) / 22 | SSH 接続情報(UserName 列が空の行の既定)。CSV の `UserName` 列を行単位で優先し、ユーザーごとに 1 回ずつパスワードを入力。 |
 | `-KeyFile` | (なし) | 秘密鍵ファイルのパス。指定すると公開鍵認証で接続(CSV の `KeyFile` 列を行単位で優先)。 |
 | `-KeyPassphrase` | (実行時入力) | 秘密鍵のパスフレーズ(SecureString)。未指定時は鍵ファイルごとに 1 回入力。 |
-| `-ConnectionTimeoutSeconds` | `15` | TCP 接続確認のタイムアウト秒。 |
+| `-ConnectionTimeoutSeconds` | `30` | TCP 接続確認および SSH / SFTP ログイン(`New-SSHSession` / `New-SFTPSession` の `-ConnectionTimeout`)のタイムアウト秒。sshd の逆引き等でログインが遅いホストで「Session operation has timed out」になる場合は延長してください。 |
 | `-CommandTimeoutSeconds` | `300` | リモートコマンド(tar 等)のタイムアウト秒。 |
 | `-EtcPath` | `/etc` | 取得対象ディレクトリ。 |
 | `-MaxFileSizeMB` | `1` | これを超えるファイルは収集しない(`0` で無制限)。除外したファイルは `etc_excluded_*.txt` に記録。 |
