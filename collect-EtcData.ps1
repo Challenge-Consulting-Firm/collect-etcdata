@@ -60,7 +60,7 @@ param(
     [string]$KeyFile,
     [securestring]$KeyPassphrase,
     [int]$Port = 22,
-    [int]$ConnectionTimeoutSeconds = 15,
+    [int]$ConnectionTimeoutSeconds = 30,
     [int]$CommandTimeoutSeconds = 300,
     [string]$EtcPath = '/etc',
     [int]$MaxFileSizeMB = 1,
@@ -399,6 +399,8 @@ foreach ($target in $targets) {
         }
 
         # sudo プレフィックス(既定はそのユーザーのログインパスワード。シングルクォートはリモートシェル向けにエスケープ)
+        # ※ ' は '\'' に置換する(PowerShell では \ はエスケープ文字ではないため "'\''" と書く。'\\'' にすると
+        #    リモート側でクォートの対応がずれ、後続行の構文エラーになる)
         # ※ echo は dash 系 /bin/sh でバックスラッシュ解釈されるため、解釈されない printf '%s\n' を使用
         # 鍵認証ではログインパスワードが無いため、-SudoPassword かユーザーごとの入力値を使用。
         # 空の場合は NOPASSWD 前提で sudo -n(パスワードを要求されたら待たずに失敗)
@@ -411,7 +413,7 @@ foreach ($target in $targets) {
             }
             else {
                 $plainSudoPw = ConvertTo-PlainText -SecureString $sudoSecure
-                $sudoPrefix = "printf '%s\n' '" + $plainSudoPw.Replace("'", "'\\''") + "' | sudo -S -p '' "
+                $sudoPrefix = "printf '%s\n' '" + $plainSudoPw.Replace("'", "'\''") + "' | sudo -S -p '' "
             }
         }
     }
@@ -463,10 +465,11 @@ foreach ($target in $targets) {
 
         # SSH / SFTP セッション共通の接続パラメーター(鍵認証時は -KeyFile を追加)
         $sessionParams = @{
-            ComputerName = $computer
-            Port         = $rowPort
-            Credential   = $hostCredential
-            ErrorAction  = 'Stop'
+            ComputerName      = $computer
+            Port              = $rowPort
+            Credential        = $hostCredential
+            ConnectionTimeout = $ConnectionTimeoutSeconds
+            ErrorAction       = 'Stop'
         }
         if ($authMethod -eq 'key') { $sessionParams['KeyFile'] = $rowKeyFile }
 
