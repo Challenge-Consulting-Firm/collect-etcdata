@@ -228,6 +228,7 @@ $maxBytes = [long]$MaxFileSizeMB * 1MB
 #       S = 機密(shadow 系・鍵ストア等のファイル名、または PEM 秘密鍵を含む)→ 収集しない
 #       B = サイズ上限超過 → 収集しない
 #       D = テキストファイルを指すシンボリックリンク → リンク先の中身で格納(tar --dereference)
+#       X = 特殊ファイル(FIFO・ソケット・デバイス)→ 収集しない(Windows の tar で展開できず、中身も持たないため)
 #     S/B に該当したシンボリックリンクと、ディレクトリ・バイナリ・リンク切れのリンクはリンクのまま格納
 #   - /etc/shadow はパスワードハッシュを REDACTED に置換した etc_shadow_redacted_<日時>.txt のみ格納
 #   - パスワードは printf '%s\n' 経由のため ps に出ず、シェルのエスケープ解釈(echo の \ 問題)も受けない
@@ -279,9 +280,10 @@ for p in "$@"; do
   if grep -qE -e "^[^:]+:[!*]?\\\$[0-9a-z]+\\\$" "$t" 2>/dev/null; then echo "S|$k|secret-password-hash|$p"; continue; fi
   if [ "$k" = L ] && grep -qI . "$t" 2>/dev/null; then echo "D|L|deref|$p"; fi
 done' sh __MAXBYTES__ {} + >"$CLASSIFY" 2>/dev/null
-sed -n -e 's/^[SB]|F|[^|]*|//p' -e 's/^D|L|[^|]*|//p' "$CLASSIFY" >"$WORK/exclude.lst"
+__SUDOPREFIX__find "__TARNAME__" \( -type p -o -type s -o -type b -o -type c \) -printf 'X|F|special(%y)|%p\n' >>"$CLASSIFY" 2>/dev/null
+sed -n -e 's/^[SBX]|F|[^|]*|//p' -e 's/^D|L|[^|]*|//p' "$CLASSIFY" >"$WORK/exclude.lst"
 sed -n -e 's/^D|L|[^|]*|//p' "$CLASSIFY" >"$WORK/deref.lst"
-sed -n -e 's/^[SB]|F|//p' -e 's/^[SB]|L|\([^|]*\)|/\1(symlink-kept)|/p' "$CLASSIFY" >"$EXCL"
+sed -n -e 's/^[SBX]|F|//p' -e 's/^[SB]|L|\([^|]*\)|/\1(symlink-kept)|/p' "$CLASSIFY" >"$EXCL"
 __SUDOPREFIX__awk -F: 'BEGIN { OFS = ":" } { p = $2; if (p != "" && p !~ /^[!*]+$/) { if (p ~ /^[!*]/) p = substr(p, 1, 1) "REDACTED"; else p = "REDACTED" } $2 = p; print }' "__ETCPATH__/shadow" >"$SHADOWRED" 2>/dev/null
 [ -s "$SHADOWRED" ] || rm -f "$SHADOWRED"
 __COMMANDBLOCK__
@@ -299,6 +301,7 @@ echo "ERRSUMMARY:$(head -c 300 "$ERRLOG" 2>/dev/null | tr '\n' ' ')"
 echo "DEREFCOUNT:$(grep -c '^D|' "$CLASSIFY")"
 echo "SECRETCOUNT:$(grep -c '^S|' "$CLASSIFY")"
 echo "LARGECOUNT:$(grep -c '^B|' "$CLASSIFY")"
+echo "SPECIALCOUNT:$(grep -c '^X|' "$CLASSIFY")"
 if [ -f "$ARCHIVE" ]; then
   echo "SIZE:$(stat -c %s "$ARCHIVE")"
   echo "SHA256:$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
@@ -519,7 +522,7 @@ foreach ($target in $targets) {
             $row.ErrorMessage += ("tar終了コード={0}(一部未収集の可能性)。" -f $tarExit)
         }
         Write-Log ("アーカイブ作成 成功: {0} ({1} bytes, {2} files)" -f $remoteArchive, $remoteSize, ($remoteFiles -replace '\s', ''))
-        Write-Log ("収集除外: 機密={0} / サイズ上限超過={1} (上限 {2} MB。一覧は etc_excluded_*.txt) / リンク実体化={3}" -f $row.ExcludedSecretCount, $row.ExcludedLargeCount, $MaxFileSizeMB, $row.DerefSymlinkCount)
+        Write-Log ("収集除外: 機密={0} / サイズ上限超過={1} (上限 {2} MB) / 特殊ファイル(FIFO 等)={4} (一覧は etc_excluded_*.txt) / リンク実体化={3}" -f $row.ExcludedSecretCount, $row.ExcludedLargeCount, $MaxFileSizeMB, $row.DerefSymlinkCount, (Get-MarkerValue -Text $stdout -Name 'SPECIALCOUNT'))
 
         # 4) SFTP ダウンロード(Posh-SSH 3.2 は SSH セッションの流用に未対応のため別セッションで按続)
         $sftpSession = New-SFTPSession @sessionParams
@@ -545,14 +548,21 @@ foreach ($target in $targets) {
         Write-Log ('整合性確認 成功 (SHA256 一致)')
 
         # 6) ローカル展開(Windows 標準の bsdtar を使用)
-        $tarOutput = & tar -xzf $localArchive -C $hostDir 2>&1
-        $tarExitCode = $LASTEXITCODE
+        # PowerShell 5.1 では ErrorActionPreference=Stop のまま外部コマンドの stderr を 2>&1 で受けると
+        # 1 行目の警告で例外になり展開が中断するため、この呼び出しだけ Continue にして文字列として受け取る
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $tarOutput = @(& tar -xzf $localArchive -C $hostDir 2>&1 | ForEach-Object { "$_" })
+            $tarExitCode = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $prevEap }
         if (-not (Test-Path -LiteralPath $row.LocalEtcPath)) {
             throw ("展開失敗: {0} が作成されませんでした。tar exit={1} / 出力: {2}" -f $row.LocalEtcPath, $tarExitCode, ((@($tarOutput) -join ' ')))
         }
         if ($tarExitCode -ne 0) {
-            Write-Log ("WARN: 展開中に警告がありました(シンボリックリンク等)。tar exit={0}: {1}" -f $tarExitCode, ((@($tarOutput) | Select-Object -First 2) -join ' ')) 'WARN'
-            $row.ErrorMessage += '展開時に警告(シンボリックリンク等)。'
+            Write-Log ("WARN: 展開中に警告がありました(シンボリックリンク・Windows で作成できないファイル名等)。tar exit={0}: {1}" -f $tarExitCode, ((@($tarOutput) | Select-Object -First 2) -join ' ')) 'WARN'
+            $row.ErrorMessage += ('展開時に警告(シンボリックリンク等)。{0}' -f ((@($tarOutput) | Select-Object -First 1) -join ''))
         }
         Write-Log ('ローカル展開 成功')
 

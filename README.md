@@ -87,6 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\collect-EtcData.ps1 -UserName admin
 | パスワードハッシュ行(`ユーザー:$6$...` 形式。shadow の退避コピーや htpasswd 等。中身で判定) | 収集しない | `secret-password-hash` |
 | PEM 形式の秘密鍵(`-----BEGIN ... PRIVATE KEY-----` を含むファイル。SSH ホスト鍵、`*.key`、`*-key.pem`、`private.key.2025` のような退避ファイル等。中身で判定) | 収集しない | `secret-private-key` |
 | `-MaxFileSizeMB`(既定 1MB)を超えるファイル(`udev/hwdb.bin`、SELinux ポリシー、`/etc` 配下に置かれたバックアップ等) | 収集しない | `size-over(<bytes> bytes)` |
+| 特殊ファイル(FIFO・ソケット・ブロック/キャラクタデバイス。例: `opt/FJSVisgui/.httpd.conf.recv`)。中身を持たず、Windows の tar では展開できないため | 収集しない | `special(p)` 等(`p`=FIFO、`s`=ソケット、`b`/`c`=デバイス。件数はログに出力) |
 | テキストファイルを指すシンボリックリンク(`os-release`、`*.wants/*.service` 等) | リンク先の中身を通常ファイルとして格納 | (記録なし。件数は `DerefSymlinkCount`) |
 | ディレクトリ・バイナリ・リンク切れ・`/proc` 等を指すリンク、上記で除外対象になったリンク | リンクのまま格納 | 除外対象のリンクは `(symlink-kept)` 付き |
 
@@ -371,6 +372,7 @@ Remove-Item -Recurse .\test\sshlab\keys          # 取り出した鍵の削除
 | `tar コマンドが見つかりません` | Windows 10 1803+ / Windows Server 1809+ を使用、または tar を PATH へ。 |
 | `アーカイブ作成失敗` | `TAREXIT=sudo` の場合は sudo の失敗(パスワード誤り等)。それ以外は対象が BusyBox 系で `find -printf`/`sha256sum` が無い可能性(メタデータ取得失敗は継続可)。TAREXIT と ERRSUMMARY をログで確認。 |
 | `メタデータ取得で一部エラー` | `-NoSudo` で読み取れないディレクトリがあった、または `find -printf` 非対応。 |
+| 展開時に `Can't create ...: Invalid argument` で中断(旧版) | FIFO 等の特殊ファイルが原因。現行版は収集時に除外し、展開時の警告でも中断しない。 |
 | 必要なファイルが収集されていない | `etc_excluded_*.txt` を確認。サイズ上限超過なら `-MaxFileSizeMB` を引き上げて再収集(`0` で無制限)。 |
 | 分析CSV に shadow 由来の列が埋まらない | `-NoSudo` で収集した可能性。sudo 付きで再収集してください。 |
 | 実行ポリシーで起動不可 | `powershell -ExecutionPolicy Bypass -File ...` |
